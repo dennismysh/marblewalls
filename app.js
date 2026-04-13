@@ -20,6 +20,7 @@
     uniform vec2  u_resolution;
     uniform float u_offsets[12];
     uniform float u_scale;
+    uniform float u_invert;
 
     float fbm5(vec2 p) {
       float val = 0.0;
@@ -87,11 +88,14 @@
       float gc = clamp(0.20 + 0.60 * sG * sG + 0.20 * sGw * sGw, 0.0, 1.0);
       float b  = clamp(0.15 + 0.85 * sB * sB, 0.0, 1.0);
 
+      // Optional color inversion (applied before vignette so corners still darken).
+      vec3 col = mix(vec3(r, gc, b), vec3(1.0) - vec3(r, gc, b), u_invert);
+
       // Vignette (matches the Python: centered [-1, 1] on each axis).
       vec2 vc = (uv - 0.5) * 2.0;
       float vig = clamp(1.0 - dot(vc, vc) * 0.15, 0.3, 1.0);
 
-      gl_FragColor = vec4(r * vig, gc * vig, b * vig, 1.0);
+      gl_FragColor = vec4(col * vig, 1.0);
     }
   `;
 
@@ -169,15 +173,17 @@
       uRes: gl.getUniformLocation(prog, "u_resolution"),
       uOff: gl.getUniformLocation(prog, "u_offsets"),
       uScale: gl.getUniformLocation(prog, "u_scale"),
+      uInvert: gl.getUniformLocation(prog, "u_invert"),
     };
   }
 
-  function render(gl, loc, width, height, offsets, scale) {
+  function render(gl, loc, width, height, offsets, scale, invert) {
     gl.viewport(0, 0, width, height);
     gl.useProgram(loc.prog);
     gl.uniform2f(loc.uRes, width, height);
     gl.uniform1fv(loc.uOff, offsets);
     gl.uniform1f(loc.uScale, scale);
+    gl.uniform1f(loc.uInvert, invert ? 1.0 : 0.0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
@@ -195,6 +201,7 @@
     width: $("#width"),
     height: $("#height"),
     scale: $("#scale"),
+    invert: $("#invert"),
     download: $("#download"),
     share: $("#share"),
     seedBadge: $("#seed-badge"),
@@ -221,6 +228,7 @@
     height: 1080,
     scale: 1.0,
     preset: "1920x1080",
+    invert: false,
   };
 
   // ---- URL params (?seed=, ?size=WxH, ?scale=) --------------------------
@@ -244,6 +252,9 @@
 
     const scale = parseFloat(p.get("scale") || "");
     if (Number.isFinite(scale)) state.scale = clamp(scale, 0.5, 2.5);
+
+    const inv = (p.get("invert") || "").toLowerCase();
+    if (inv === "1" || inv === "true") state.invert = true;
   }
 
   function writeURL() {
@@ -251,6 +262,7 @@
     p.set("seed", String(state.seed));
     p.set("size", `${state.width}x${state.height}`);
     if (state.scale !== 1) p.set("scale", state.scale.toFixed(2));
+    if (state.invert) p.set("invert", "1");
     history.replaceState(null, "", `?${p.toString()}`);
   }
 
@@ -289,7 +301,7 @@
     // Note: preview uses target aspect, but any resolution — the algorithm's
     // appearance only depends on aspect and scale, not pixel count.
     const offsets = offsetsForSeed(state.seed);
-    render(gl, loc, w, h, offsets, state.scale);
+    render(gl, loc, w, h, offsets, state.scale, state.invert);
     updateBadges();
   }
 
@@ -329,7 +341,7 @@
     }
 
     const offsets = offsetsForSeed(state.seed);
-    render(ogl, oloc, w, h, offsets, state.scale);
+    render(ogl, oloc, w, h, offsets, state.scale, state.invert);
 
     off.toBlob(
       (blob) => {
@@ -385,6 +397,7 @@
     els.scale.value = state.scale;
     els.width.value = state.width;
     els.height.value = state.height;
+    els.invert.checked = state.invert;
     // Preset
     const v = `${state.width}x${state.height}`;
     const opt = Array.from(els.preset.options).find((o) => o.value === v);
@@ -435,6 +448,11 @@
 
   els.scale.addEventListener("input", (e) => {
     state.scale = parseFloat(e.target.value) || 1.0;
+    scheduleRender();
+  });
+
+  els.invert.addEventListener("change", (e) => {
+    state.invert = !!e.target.checked;
     scheduleRender();
   });
 
