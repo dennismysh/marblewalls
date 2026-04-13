@@ -211,6 +211,14 @@
     seedBadge: $("#seed-badge"),
     sizeBadge: $("#size-badge"),
     loading: $("#loading"),
+    animDuration: $("#anim-duration"),
+    animSize: $("#anim-size"),
+    animWarning: $("#anim-warning"),
+    exportGif: $("#export-gif"),
+    exportMp4: $("#export-mp4"),
+    animProgress: $("#anim-progress"),
+    animProgressBar: $("#anim-progress-bar"),
+    animProgressLabel: $("#anim-progress-label"),
   };
 
   // Preview GL context + program
@@ -233,7 +241,14 @@
     scale: 1.0,
     preset: "1920x1080",
     invert: false,
+    animDurationSec: 4,
+    animSizeP: 2160, // long-edge target for GIF / MP4 export (4K)
   };
+
+  // Animation radius: how far the first domain-warp layer drifts on its circle.
+  // 0.35 is organic without losing the seed's identity.
+  const ANIM_RADIUS = 0.35;
+  const FPS = 24;
 
   // ---- URL params (?seed=, ?size=WxH, ?scale=) --------------------------
   function loadFromURL() {
@@ -368,6 +383,359 @@
     els.loading.hidden = !on;
   }
 
+  // ---- Perfect-loop animation + GIF/MP4 export --------------------------
+  //
+  // The shader has no time uniform. To produce a *perfect* loop, we add a
+  // circular perturbation to the first domain-warp layer's offsets
+  // (o0..o3). Because cos/sin are 2π-periodic, frame 0 and frame N are
+  // byte-identical — no seam when wrapping.
+
+  function animatedOffsets(base, i, N, radius) {
+    const out = new Float32Array(12);
+    const t = (2 * Math.PI * i) / N;
+    const r = radius || ANIM_RADIUS;
+    const cosT = Math.cos(t);
+    const sinT = Math.sin(t);
+    // Decoupled orbit for the second pair — quarter-turn phase shift.
+    const cosTQ = Math.cos(t + Math.PI / 2);
+    const sinTQ = Math.sin(t + Math.PI / 2);
+    out[0] = base[0] + r * cosT;
+    out[1] = base[1] + r * sinT;
+    out[2] = base[2] + r * cosTQ;
+    out[3] = base[3] + r * sinTQ;
+    for (let k = 4; k < 12; k++) out[k] = base[k];
+    return out;
+  }
+
+  // GIF format stores per-frame delay in integer centiseconds (1/100 s).
+  // True 24 fps is 100/24 ≈ 4.1667 cs, which is not representable. We
+  // alternate 4 cs and 5 cs in a 5:1 ratio so a 6-frame block sums to 25 cs,
+  // yielding exactly 100 cs per 24 frames = 24.00 fps average.
+  function delayCsForFrame(i) {
+    return i % 6 === 5 ? 5 : 4;
+  }
+
+  function animDimensionsFor(longP, srcW, srcH, maxTex) {
+    // Size selector controls the long-edge pixel count; aspect ratio comes
+    // from the user's PNG preset. The shader is resolution-independent —
+    // it only cares about aspect and scale — so we can render at any size.
+    const cap = Math.min(longP, maxTex);
+    let w, h;
+    if (srcW >= srcH) {
+      w = cap;
+      h = Math.max(2, Math.round((cap * srcH) / srcW));
+    } else {
+      h = cap;
+      w = Math.max(2, Math.round((cap * srcW) / srcH));
+    }
+    // H.264 requires even dims; GIF benefits too.
+    w = Math.max(2, w - (w % 2));
+    h = Math.max(2, h - (h % 2));
+    return { w, h };
+  }
+
+  function flipRowsRGBA(src, w, h, dst) {
+    const rowBytes = w * 4;
+    for (let y = 0; y < h; y++) {
+      const srcOff = (h - 1 - y) * rowBytes;
+      const dstOff = y * rowBytes;
+      dst.set(src.subarray(srcOff, srcOff + rowBytes), dstOff);
+    }
+  }
+
+  function setAnimProgress(pct, label) {
+    els.animProgress.hidden = false;
+    els.animProgressBar.value = Math.max(0, Math.min(100, pct));
+    if (label !== undefined) els.animProgressLabel.textContent = label;
+  }
+
+  function hideAnimProgress() {
+    els.animProgress.hidden = true;
+    els.animProgressBar.value = 0;
+    els.animProgressLabel.textContent = "";
+  }
+
+  function setExportButtonsDisabled(disabled) {
+    for (const btn of [els.download, els.exportGif, els.exportMp4, els.share]) {
+      if (!btn) continue;
+      btn.disabled = disabled;
+      btn.setAttribute("aria-disabled", String(disabled));
+    }
+  }
+
+  // Shared frame generator. Renders N frames of the perfectly-looping
+  // animation into a dedicated offscreen WebGL context, calling `onFrame`
+  // with either a pixel buffer (for GIF) or the canvas itself (for MP4).
+  async function renderFrames({ w, h, N, needsPixels, onFrame, onStatus }) {
+    const off = document.createElement("canvas");
+    off.width = w;
+    off.height = h;
+    const ogl = createGL(off);
+    const oloc = makeProgram(ogl);
+
+    const maxTex = ogl.getParameter(ogl.MAX_TEXTURE_SIZE);
+    if (w > maxTex || h > maxTex) {
+      throw new Error(`This device caps GPU textures at ${maxTex}px. Pick a smaller size.`);
+    }
+
+    const base = offsetsForSeed(state.seed);
+    const readBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
+    const flipBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
+
+    for (let i = 0; i < N; i++) {
+      const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
+      render(ogl, oloc, w, h, offs, state.scale, state.invert);
+      if (needsPixels) {
+        ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
+        flipRowsRGBA(readBuf, w, h, flipBuf);
+        await onFrame(i, flipBuf, off);
+      } else {
+        await onFrame(i, null, off);
+      }
+      if (onStatus) onStatus(i + 1, N);
+      // Yield to the event loop so the progress UI can paint and the tab
+      // stays responsive. A setTimeout(0) is enough on all browsers.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    // Help the GC release the offscreen GPU context promptly.
+    const lose = ogl.getExtension("WEBGL_lose_context");
+    if (lose) lose.loseContext();
+  }
+
+  function triggerDownload(blob, filename) {
+    const a = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  async function exportGIF() {
+    if (!window.GIFEnc) { toast("GIF encoder failed to load."); return; }
+
+    const durationSec = state.animDurationSec;
+    const N = durationSec * FPS; // multiple of 6 by construction (2/4/6/8 × 24)
+    let w, h;
+    try {
+      const probeCanvas = document.createElement("canvas");
+      const probeGL = createGL(probeCanvas);
+      const maxTex = probeGL.getParameter(probeGL.MAX_TEXTURE_SIZE);
+      const lose = probeGL.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+      ({ w, h } = animDimensionsFor(state.animSizeP, state.width, state.height, maxTex));
+    } catch (err) {
+      toast("WebGL init failed: " + err.message);
+      return;
+    }
+
+    setExportButtonsDisabled(true);
+    setAnimProgress(0, "Preparing…");
+    // Two-frame yield so the progress UI actually paints before the heavy work.
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    const { GIFEncoder, quantize, applyPalette } = window.GIFEnc;
+
+    try {
+      // Pass 1: build a shared palette from 4 sample frames (0, N/4, N/2,
+      // 3N/4). A single palette across every frame is essential for a
+      // clean loop seam — per-frame palettes introduce dithering shimmer.
+      setAnimProgress(0, "Building palette…");
+      const sampleIndices = [0, Math.floor(N / 4), Math.floor(N / 2), Math.floor((3 * N) / 4)];
+      const sampleBuf = new Uint8Array(sampleIndices.length * w * h * 4);
+      {
+        const off = document.createElement("canvas");
+        off.width = w;
+        off.height = h;
+        const ogl = createGL(off);
+        const oloc = makeProgram(ogl);
+        const base = offsetsForSeed(state.seed);
+        const readBuf = new Uint8Array(w * h * 4);
+        const flipBuf = new Uint8Array(w * h * 4);
+        for (let s = 0; s < sampleIndices.length; s++) {
+          const i = sampleIndices[s];
+          const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
+          render(ogl, oloc, w, h, offs, state.scale, state.invert);
+          ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
+          flipRowsRGBA(readBuf, w, h, flipBuf);
+          sampleBuf.set(flipBuf, s * w * h * 4);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        const lose = ogl.getExtension("WEBGL_lose_context");
+        if (lose) lose.loseContext();
+      }
+      const palette = quantize(sampleBuf, 256, { format: "rgb444" });
+
+      // Pass 2: render each frame and write it to the GIF.
+      const gif = GIFEncoder();
+      await renderFrames({
+        w, h, N,
+        needsPixels: true,
+        onFrame: (i, pixels) => {
+          const indexed = applyPalette(pixels, palette, "rgb444");
+          gif.writeFrame(indexed, w, h, {
+            palette: i === 0 ? palette : undefined,
+            delay: delayCsForFrame(i) * 10, // writeFrame takes ms; round(ms/10)=cs
+            repeat: 0,
+          });
+        },
+        onStatus: (done, total) => {
+          const pct = (done / total) * 100;
+          setAnimProgress(pct, `Encoding GIF… frame ${done} / ${total}`);
+        },
+      });
+      setAnimProgress(100, "Finalizing…");
+      await new Promise((r) => setTimeout(r, 0));
+      gif.finish();
+      const bytes = gif.bytesView();
+      const blob = new Blob([bytes], { type: "image/gif" });
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_24fps.gif`;
+      triggerDownload(blob, filename);
+      toast(`GIF exported (${formatBytes(blob.size)})`);
+    } catch (err) {
+      console.error(err);
+      toast("GIF export failed: " + err.message);
+    } finally {
+      hideAnimProgress();
+      setExportButtonsDisabled(false);
+    }
+  }
+
+  async function exportMP4() {
+    if (!("VideoEncoder" in window)) {
+      toast("MP4 export needs WebCodecs (Chrome/Edge, Safari 16.4+, Firefox 130+).");
+      return;
+    }
+    if (!window.Mp4Muxer) { toast("MP4 muxer failed to load."); return; }
+
+    const durationSec = state.animDurationSec;
+    const N = durationSec * FPS;
+    let w, h;
+    try {
+      const probeCanvas = document.createElement("canvas");
+      const probeGL = createGL(probeCanvas);
+      const maxTex = probeGL.getParameter(probeGL.MAX_TEXTURE_SIZE);
+      const lose = probeGL.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+      ({ w, h } = animDimensionsFor(state.animSizeP, state.width, state.height, maxTex));
+    } catch (err) {
+      toast("WebGL init failed: " + err.message);
+      return;
+    }
+
+    setExportButtonsDisabled(true);
+    setAnimProgress(0, "Preparing…");
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    const bitrate = Math.max(2_000_000, Math.min(40_000_000, Math.round(w * h * FPS * 0.1)));
+
+    let encoder = null;
+    try {
+      const muxer = new Mp4Muxer.Muxer({
+        target: new Mp4Muxer.ArrayBufferTarget(),
+        video: { codec: "avc", width: w, height: h, frameRate: FPS },
+        fastStart: "in-memory",
+      });
+
+      encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => { throw e; },
+      });
+
+      // H.264 High profile, level chosen by pixel count:
+      //   4.0 (avc1.640028) → up to 1080p @ 30fps
+      //   5.0 (avc1.640032) → up to 1440p
+      //   5.1 (avc1.640033) → up to 4K @ 30fps
+      //   5.2 (avc1.640034) → up to 4K @ 60fps / 8K @ 30fps
+      const pixelCount = w * h;
+      let codec;
+      if (pixelCount <= 1920 * 1080) codec = "avc1.640028";
+      else if (pixelCount <= 2560 * 1440) codec = "avc1.640032";
+      else if (pixelCount <= 3840 * 2160) codec = "avc1.640033";
+      else codec = "avc1.640034";
+
+      // Try the chosen codec first, then fall back to the next higher level
+      // if the browser's H.264 encoder rejects it.
+      const candidates = ["avc1.640028", "avc1.640032", "avc1.640033", "avc1.640034"];
+      const startIdx = candidates.indexOf(codec);
+      let chosen = null;
+      for (let idx = startIdx; idx < candidates.length; idx++) {
+        const cfg = { codec: candidates[idx], width: w, height: h, bitrate, framerate: FPS };
+        // eslint-disable-next-line no-await-in-loop
+        const sup = await VideoEncoder.isConfigSupported(cfg);
+        if (sup && sup.supported) { chosen = cfg; break; }
+      }
+      if (!chosen) throw new Error("No supported H.264 config for this resolution.");
+      encoder.configure(chosen);
+
+      const frameDurUs = Math.round(1_000_000 / FPS);
+
+      await renderFrames({
+        w, h, N,
+        needsPixels: false,
+        onFrame: (i, _pixels, canvas) => {
+          const timestamp = Math.round((i * 1_000_000) / FPS);
+          const vf = new VideoFrame(canvas, { timestamp, duration: frameDurUs });
+          // 1 keyframe per second + first frame, for seekability.
+          encoder.encode(vf, { keyFrame: i === 0 || i % FPS === 0 });
+          vf.close();
+        },
+        onStatus: (done, total) => {
+          const pct = (done / total) * 100;
+          setAnimProgress(pct, `Encoding MP4… frame ${done} / ${total}`);
+        },
+      });
+
+      setAnimProgress(100, "Finalizing…");
+      await encoder.flush();
+      muxer.finalize();
+      const bytes = muxer.target.buffer;
+      const blob = new Blob([bytes], { type: "video/mp4" });
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_24fps.mp4`;
+      triggerDownload(blob, filename);
+      toast(`MP4 exported (${formatBytes(blob.size)})`);
+    } catch (err) {
+      console.error(err);
+      toast("MP4 export failed: " + err.message);
+    } finally {
+      if (encoder && encoder.state !== "closed") {
+        try { encoder.close(); } catch (_) { /* ignore */ }
+      }
+      hideAnimProgress();
+      setExportButtonsDisabled(false);
+    }
+  }
+
+  function formatBytes(n) {
+    if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + " GB";
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + " MB";
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + " KB";
+    return n + " B";
+  }
+
+  function updateAnimWarning() {
+    const p = state.animSizeP;
+    const hasMp4 = "VideoEncoder" in window;
+    const lines = [];
+    if (p >= 2160) {
+      lines.push("4K GIFs can exceed several hundred MB and take minutes to encode.");
+      if (hasMp4) lines.push("MP4 at 4K is much smaller (~20–80 MB) and typically a better choice.");
+    } else if (p >= 1080) {
+      lines.push("1080p GIFs can be 30–70 MB. MP4 at 1080p is ~6–15 MB.");
+    }
+    if (lines.length === 0) {
+      els.animWarning.hidden = true;
+      els.animWarning.textContent = "";
+    } else {
+      els.animWarning.hidden = false;
+      els.animWarning.textContent = lines.join(" ");
+      els.animWarning.classList.toggle("warn-strong", p >= 2160);
+    }
+  }
+
   // ---- Toast ------------------------------------------------------------
   let toastEl;
   let toastTimer;
@@ -407,6 +775,10 @@
     const opt = Array.from(els.preset.options).find((o) => o.value === v);
     els.preset.value = opt ? v : "custom";
     els.customSize.hidden = els.preset.value !== "custom";
+    // Animation controls
+    els.animDuration.value = String(state.animDurationSec);
+    els.animSize.value = String(state.animSizeP);
+    updateAnimWarning();
   }
 
   function setSeed(val) {
@@ -461,6 +833,25 @@
   });
 
   els.download.addEventListener("click", downloadPNG);
+
+  els.animDuration.addEventListener("change", (e) => {
+    const v = parseInt(e.target.value, 10);
+    if (Number.isFinite(v) && v > 0) state.animDurationSec = v;
+  });
+
+  els.animSize.addEventListener("change", (e) => {
+    const v = parseInt(e.target.value, 10);
+    if (Number.isFinite(v) && v > 0) state.animSizeP = v;
+    updateAnimWarning();
+  });
+
+  els.exportGif.addEventListener("click", exportGIF);
+  els.exportMp4.addEventListener("click", exportMP4);
+
+  // WebCodecs availability check: hide the MP4 button on unsupported browsers.
+  if (!("VideoEncoder" in window)) {
+    els.exportMp4.hidden = true;
+  }
 
   els.share.addEventListener("click", async () => {
     writeURL();
