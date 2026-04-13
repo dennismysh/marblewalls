@@ -88,14 +88,18 @@
       float gc = clamp(0.20 + 0.60 * sG * sG + 0.20 * sGw * sGw, 0.0, 1.0);
       float b  = clamp(0.15 + 0.85 * sB * sB, 0.0, 1.0);
 
-      // Optional color inversion (applied before vignette so corners still darken).
-      vec3 col = mix(vec3(r, gc, b), vec3(1.0) - vec3(r, gc, b), u_invert);
+      vec3 col = vec3(r, gc, b);
 
       // Vignette (matches the Python: centered [-1, 1] on each axis).
       vec2 vc = (uv - 0.5) * 2.0;
       float vig = clamp(1.0 - dot(vc, vc) * 0.15, 0.3, 1.0);
 
-      gl_FragColor = vec4(col * vig, 1.0);
+      // Invert the fully-rendered output (including vignette) so the result
+      // is a true color-negative of what you'd otherwise see on screen.
+      vec3 rendered = col * vig;
+      rendered = mix(rendered, vec3(1.0) - rendered, u_invert);
+
+      gl_FragColor = vec4(rendered, 1.0);
     }
   `;
 
