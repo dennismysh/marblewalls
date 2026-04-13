@@ -56,13 +56,6 @@ Every setting is reflected in the URL so you can share an exact wallpaper:
 - `?size=3840x2160` — output resolution
 - `?scale=1.25` — pattern zoom (0.5–2.5)
 
-## Why not Railway?
-
-Railway is great when you need a server. This generator is pure math — running
-it client-side on the GPU is faster (no network round-trip), free to host, and
-has no cold starts. If you later want server features (galleries, accounts,
-NSFW moderation, etc.) Railway becomes the right call.
-
 ## License
 
 Marble Walls is released under the MIT License — see `LICENSE`. The original
