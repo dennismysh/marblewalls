@@ -21,6 +21,9 @@
     uniform float u_offsets[12];
     uniform float u_scale;
     uniform float u_invert;
+    uniform float u_useCustomPalette;
+    uniform int   u_paletteCount;
+    uniform vec3  u_palette[8];
 
     float fbm5(vec2 p) {
       float val = 0.0;
@@ -89,6 +92,26 @@
       float b  = clamp(0.15 + 0.85 * sB * sB, 0.0, 1.0);
 
       vec3 col = vec3(r, gc, b);
+
+      // Custom palette: sample a smooth gradient across the user's N colors.
+      // Drive it with the same noise 'f' that informs the procedural palette,
+      // plus a dash of 'wm' so bands follow the marble's domain warping.
+      if (u_useCustomPalette > 0.5) {
+        float t = clamp(f + wm * 0.1, 0.0, 1.0);
+        float idx = t * float(u_paletteCount - 1);
+        float idx0 = floor(idx);
+        float idx1 = min(idx0 + 1.0, float(u_paletteCount - 1));
+        float m = idx - idx0;
+        // WebGL1 requires constant index expressions — select via static loop.
+        vec3 c0 = vec3(0.0);
+        vec3 c1 = vec3(0.0);
+        for (int k = 0; k < 8; k++) {
+          float fk = float(k);
+          if (fk == idx0) c0 = u_palette[k];
+          if (fk == idx1) c1 = u_palette[k];
+        }
+        col = mix(c0, c1, m);
+      }
 
       // Vignette (matches the Python: centered [-1, 1] on each axis).
       vec2 vc = (uv - 0.5) * 2.0;
@@ -178,18 +201,33 @@
       uOff: gl.getUniformLocation(prog, "u_offsets"),
       uScale: gl.getUniformLocation(prog, "u_scale"),
       uInvert: gl.getUniformLocation(prog, "u_invert"),
+      uUseCustomPalette: gl.getUniformLocation(prog, "u_useCustomPalette"),
+      uPaletteCount: gl.getUniformLocation(prog, "u_paletteCount"),
+      uPalette: gl.getUniformLocation(prog, "u_palette[0]"),
     };
   }
 
-  function render(gl, loc, width, height, offsets, scale, invert) {
+  function render(gl, loc, width, height, offsets, scale, invert, paletteOpts) {
     gl.viewport(0, 0, width, height);
     gl.useProgram(loc.prog);
     gl.uniform2f(loc.uRes, width, height);
     gl.uniform1fv(loc.uOff, offsets);
     gl.uniform1f(loc.uScale, scale);
     gl.uniform1f(loc.uInvert, invert ? 1.0 : 0.0);
+    const po = paletteOpts || EMPTY_PALETTE_UNIFORM;
+    gl.uniform1f(loc.uUseCustomPalette, po.use ? 1.0 : 0.0);
+    gl.uniform1i(loc.uPaletteCount, po.count);
+    gl.uniform3fv(loc.uPalette, po.colors);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
+
+  // Zero-filled palette uniform for calls that don't use a custom palette
+  // (keeps the shader happy — uniforms must always have a value).
+  const EMPTY_PALETTE_UNIFORM = {
+    use: false,
+    count: 2,
+    colors: new Float32Array(24),
+  };
 
   // ---- App --------------------------------------------------------------
 
@@ -206,6 +244,13 @@
     height: $("#height"),
     scale: $("#scale"),
     invert: $("#invert"),
+    paletteToggle: $("#palette-toggle"),
+    paletteField: $("#palette-field"),
+    paletteCount: $("#palette-count"),
+    paletteCountValue: $("#palette-count-value"),
+    paletteSwatchesEl: $("#palette-swatches"),
+    paletteSwatches: document.querySelectorAll("#palette-swatches .swatch"),
+    paletteRandomize: $("#palette-randomize"),
     download: $("#download"),
     share: $("#share"),
     seedBadge: $("#seed-badge"),
@@ -234,6 +279,11 @@
     return;
   }
 
+  const DEFAULT_PALETTE = ["#5b8cff", "#8b5bff", "#ff5b8c", "#ffbc5b",
+                           "#5bffbc", "#ff5b5b", "#5bffff", "#ffffff"];
+  const MAX_PALETTE = 8;
+  const MIN_PALETTE = 2;
+
   const state = {
     seed: 0,
     width: 1920,
@@ -243,12 +293,67 @@
     invert: false,
     animDurationSec: 4,
     animSizeP: 2160, // long-edge target for GIF / MP4 export (4K)
+    useCustomPalette: false,
+    paletteCount: 4,
+    palette: DEFAULT_PALETTE.slice(),
   };
 
   // Animation radius: how far the first domain-warp layer drifts on its circle.
   // 0.35 is organic without losing the seed's identity.
   const ANIM_RADIUS = 0.35;
   const FPS = 24;
+
+  // ---- Palette helpers --------------------------------------------------
+  function hexToRgb(hex) {
+    const m = String(hex || "").match(/^#?([0-9a-f]{6})$/i);
+    if (!m) return [0, 0, 0];
+    const n = parseInt(m[1], 16);
+    return [((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255];
+  }
+
+  function normalizeHex(hex) {
+    const m = String(hex || "").match(/^#?([0-9a-f]{6})$/i);
+    return m ? "#" + m[1].toLowerCase() : null;
+  }
+
+  function hslToHex(h, s, l) {
+    // h in [0,1], s/l in [0,1]
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => {
+      const k = (n + h * 12) % 12;
+      const c = l - a * Math.max(-1, Math.min(Math.min(k - 3, 9 - k), 1));
+      return Math.round(c * 255).toString(16).padStart(2, "0");
+    };
+    return "#" + f(0) + f(8) + f(4);
+  }
+
+  function randomPalette(count) {
+    const n = Math.max(MIN_PALETTE, Math.min(MAX_PALETTE, count | 0));
+    const out = [];
+    // Drop an anchor hue, then spread the rest around the wheel so we get
+    // a varied-but-coherent set instead of N near-identical colors.
+    const anchor = Math.random();
+    for (let i = 0; i < n; i++) {
+      const jitter = (Math.random() - 0.5) * 0.1;
+      const h = (anchor + i / n + jitter + 1) % 1;
+      const s = 0.6 + Math.random() * 0.25;
+      const l = 0.45 + Math.random() * 0.2;
+      out.push(hslToHex(h, s, l));
+    }
+    return out;
+  }
+
+  function buildPaletteUniform(state) {
+    const buf = new Float32Array(MAX_PALETTE * 3);
+    const count = Math.max(MIN_PALETTE, Math.min(MAX_PALETTE, state.paletteCount));
+    for (let i = 0; i < count; i++) {
+      const [r, g, b] = hexToRgb(state.palette[i] || "#000000");
+      buf[i * 3] = r;
+      buf[i * 3 + 1] = g;
+      buf[i * 3 + 2] = b;
+    }
+    return { use: !!state.useCustomPalette, count, colors: buf };
+  }
 
   // ---- URL params (?seed=, ?size=WxH, ?scale=) --------------------------
   function loadFromURL() {
@@ -274,6 +379,22 @@
 
     const inv = (p.get("invert") || "").toLowerCase();
     if (inv === "1" || inv === "true") state.invert = true;
+
+    // palette=5b8cff-8b5bff-ff5b8c-ffbc5b — absence means procedural mode.
+    const paletteStr = p.get("palette") || "";
+    if (paletteStr) {
+      const parts = paletteStr
+        .split(/[-,]/)
+        .map((s) => normalizeHex(s))
+        .filter(Boolean);
+      if (parts.length >= MIN_PALETTE) {
+        const count = Math.min(parts.length, MAX_PALETTE);
+        state.useCustomPalette = true;
+        state.paletteCount = count;
+        // Preserve defaults in unused slots so toggling count back up looks nice.
+        for (let i = 0; i < count; i++) state.palette[i] = parts[i];
+      }
+    }
   }
 
   function writeURL() {
@@ -282,6 +403,12 @@
     p.set("size", `${state.width}x${state.height}`);
     if (state.scale !== 1) p.set("scale", state.scale.toFixed(2));
     if (state.invert) p.set("invert", "1");
+    if (state.useCustomPalette) {
+      const hexes = state.palette
+        .slice(0, state.paletteCount)
+        .map((h) => (h || "#000000").replace(/^#/, ""));
+      p.set("palette", hexes.join("-"));
+    }
     history.replaceState(null, "", `?${p.toString()}`);
   }
 
@@ -320,7 +447,7 @@
     // Note: preview uses target aspect, but any resolution — the algorithm's
     // appearance only depends on aspect and scale, not pixel count.
     const offsets = offsetsForSeed(state.seed);
-    render(gl, loc, w, h, offsets, state.scale, state.invert);
+    render(gl, loc, w, h, offsets, state.scale, state.invert, buildPaletteUniform(state));
     updateBadges();
   }
 
@@ -360,7 +487,7 @@
     }
 
     const offsets = offsetsForSeed(state.seed);
-    render(ogl, oloc, w, h, offsets, state.scale, state.invert);
+    render(ogl, oloc, w, h, offsets, state.scale, state.invert, buildPaletteUniform(state));
 
     off.toBlob(
       (blob) => {
@@ -479,12 +606,13 @@
     }
 
     const base = offsetsForSeed(state.seed);
+    const paletteOpts = buildPaletteUniform(state);
     const readBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
     const flipBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
 
     for (let i = 0; i < N; i++) {
       const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
-      render(ogl, oloc, w, h, offs, state.scale, state.invert);
+      render(ogl, oloc, w, h, offs, state.scale, state.invert, paletteOpts);
       if (needsPixels) {
         ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
         flipRowsRGBA(readBuf, w, h, flipBuf);
@@ -553,12 +681,13 @@
         const ogl = createGL(off);
         const oloc = makeProgram(ogl);
         const base = offsetsForSeed(state.seed);
+        const paletteOpts = buildPaletteUniform(state);
         const readBuf = new Uint8Array(w * h * 4);
         const flipBuf = new Uint8Array(w * h * 4);
         for (let s = 0; s < sampleIndices.length; s++) {
           const i = sampleIndices[s];
           const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
-          render(ogl, oloc, w, h, offs, state.scale, state.invert);
+          render(ogl, oloc, w, h, offs, state.scale, state.invert, paletteOpts);
           ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
           flipRowsRGBA(readBuf, w, h, flipBuf);
           sampleBuf.set(flipBuf, s * w * h * 4);
@@ -779,6 +908,22 @@
     els.animDuration.value = String(state.animDurationSec);
     els.animSize.value = String(state.animSizeP);
     updateAnimWarning();
+    // Palette controls
+    syncPaletteControlsFromState();
+  }
+
+  function syncPaletteControlsFromState() {
+    if (!els.paletteToggle) return;
+    els.paletteToggle.checked = !!state.useCustomPalette;
+    els.paletteField.hidden = !state.useCustomPalette;
+    els.paletteCount.value = String(state.paletteCount);
+    els.paletteCountValue.textContent = String(state.paletteCount);
+    for (let i = 0; i < els.paletteSwatches.length; i++) {
+      const sw = els.paletteSwatches[i];
+      const hex = normalizeHex(state.palette[i]) || "#000000";
+      sw.value = hex;
+      sw.hidden = i >= state.paletteCount;
+    }
   }
 
   function setSeed(val) {
@@ -831,6 +976,42 @@
     state.invert = !!e.target.checked;
     scheduleRender();
   });
+
+  if (els.paletteToggle) {
+    els.paletteToggle.addEventListener("change", (e) => {
+      state.useCustomPalette = !!e.target.checked;
+      els.paletteField.hidden = !state.useCustomPalette;
+      scheduleRender();
+    });
+
+    els.paletteCount.addEventListener("input", (e) => {
+      const n = clamp(parseInt(e.target.value, 10) || MIN_PALETTE, MIN_PALETTE, MAX_PALETTE);
+      state.paletteCount = n;
+      els.paletteCountValue.textContent = String(n);
+      for (let i = 0; i < els.paletteSwatches.length; i++) {
+        els.paletteSwatches[i].hidden = i >= n;
+      }
+      scheduleRender();
+    });
+
+    els.paletteSwatches.forEach((sw, i) => {
+      sw.addEventListener("input", (e) => {
+        const hex = normalizeHex(e.target.value);
+        if (!hex) return;
+        state.palette[i] = hex;
+        scheduleRender();
+      });
+    });
+
+    els.paletteRandomize.addEventListener("click", () => {
+      const fresh = randomPalette(state.paletteCount);
+      for (let i = 0; i < fresh.length; i++) {
+        state.palette[i] = fresh[i];
+        if (els.paletteSwatches[i]) els.paletteSwatches[i].value = fresh[i];
+      }
+      scheduleRender();
+    });
+  }
 
   els.download.addEventListener("click", downloadPNG);
 

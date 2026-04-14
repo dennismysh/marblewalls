@@ -482,3 +482,55 @@ input[type="range"]::-moz-range-thumb {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+
+.palette-count-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.palette-count-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.palette-swatches {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.palette-swatches .swatch {
+  width: 100%;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  padding: 2px;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+
+.palette-swatches .swatch:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.palette-swatches .swatch:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(106, 161, 255, 0.18);
+}
+
+.palette-swatches .swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+.palette-swatches .swatch::-webkit-color-swatch {
+  border: none;
+  border-radius: 8px;
+}
+.palette-swatches .swatch::-moz-color-swatch {
+  border: none;
+  border-radius: 8px;
+}
