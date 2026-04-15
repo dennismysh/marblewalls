@@ -258,6 +258,7 @@
     loading: $("#loading"),
     animDuration: $("#anim-duration"),
     animSize: $("#anim-size"),
+    animFps: $("#anim-fps"),
     animWarning: $("#anim-warning"),
     exportGif: $("#export-gif"),
     exportMp4: $("#export-mp4"),
@@ -293,6 +294,7 @@
     invert: false,
     animDurationSec: 4,
     animSizeP: 2160, // long-edge target for GIF / MP4 export (4K)
+    videoFps: 24, // MP4 frame rate; GIF is always 24 fps (see delayCsForFrame)
     useCustomPalette: false,
     paletteCount: 4,
     palette: DEFAULT_PALETTE.slice(),
@@ -301,7 +303,11 @@
   // Animation radius: how far the first domain-warp layer drifts on its circle.
   // 0.35 is organic without losing the seed's identity.
   const ANIM_RADIUS = 0.35;
-  const FPS = 24;
+  // GIF is locked to 24 fps because its per-frame delay is an integer in
+  // centiseconds — see delayCsForFrame for the alternating 4/5 cs pattern
+  // that averages exactly 100/24. MP4 frame rate is user-selectable via
+  // state.videoFps.
+  const GIF_FPS = 24;
 
   // ---- Palette helpers --------------------------------------------------
   function hexToRgb(hex) {
@@ -646,7 +652,7 @@
     if (!window.GIFEnc) { toast("GIF encoder failed to load."); return; }
 
     const durationSec = state.animDurationSec;
-    const N = durationSec * FPS; // multiple of 6 by construction (2/4/6/8 × 24)
+    const N = durationSec * GIF_FPS; // multiple of 6 by construction (2/4/6/8 × 24)
     let w, h;
     try {
       const probeCanvas = document.createElement("canvas");
@@ -721,7 +727,7 @@
       gif.finish();
       const bytes = gif.bytesView();
       const blob = new Blob([bytes], { type: "image/gif" });
-      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_24fps.gif`;
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${GIF_FPS}fps.gif`;
       triggerDownload(blob, filename);
       toast(`GIF exported (${formatBytes(blob.size)})`);
     } catch (err) {
@@ -741,7 +747,8 @@
     if (!window.Mp4Muxer) { toast("MP4 muxer failed to load."); return; }
 
     const durationSec = state.animDurationSec;
-    const N = durationSec * FPS;
+    const fps = state.videoFps;
+    const N = durationSec * fps;
     let w, h;
     try {
       const probeCanvas = document.createElement("canvas");
@@ -759,13 +766,13 @@
     setAnimProgress(0, "Preparing…");
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-    const bitrate = Math.max(2_000_000, Math.min(40_000_000, Math.round(w * h * FPS * 0.1)));
+    const bitrate = Math.max(2_000_000, Math.min(40_000_000, Math.round(w * h * fps * 0.1)));
 
     let encoder = null;
     try {
       const muxer = new Mp4Muxer.Muxer({
         target: new Mp4Muxer.ArrayBufferTarget(),
-        video: { codec: "avc", width: w, height: h, frameRate: FPS },
+        video: { codec: "avc", width: w, height: h, frameRate: fps },
         fastStart: "in-memory",
       });
 
@@ -774,42 +781,46 @@
         error: (e) => { throw e; },
       });
 
-      // H.264 High profile, level chosen by pixel count:
+      // H.264 High profile, level chosen by pixel count × frame rate.
+      // Each level has a macroblocks-per-second ceiling, so higher fps
+      // pushes us up a level even at the same resolution (e.g. 1080p@60
+      // needs 4.2, not 4.0).
       //   4.0 (avc1.640028) → up to 1080p @ 30fps
-      //   5.0 (avc1.640032) → up to 1440p
+      //   4.2 (avc1.64002a) → up to 1080p @ 60fps
+      //   5.0 (avc1.640032) → up to 1440p @ 30fps
       //   5.1 (avc1.640033) → up to 4K @ 30fps
       //   5.2 (avc1.640034) → up to 4K @ 60fps / 8K @ 30fps
       const pixelCount = w * h;
       let codec;
-      if (pixelCount <= 1920 * 1080) codec = "avc1.640028";
-      else if (pixelCount <= 2560 * 1440) codec = "avc1.640032";
-      else if (pixelCount <= 3840 * 2160) codec = "avc1.640033";
+      if (pixelCount <= 1920 * 1080) codec = fps > 30 ? "avc1.64002a" : "avc1.640028";
+      else if (pixelCount <= 2560 * 1440) codec = fps > 30 ? "avc1.640033" : "avc1.640032";
+      else if (pixelCount <= 3840 * 2160) codec = fps > 30 ? "avc1.640034" : "avc1.640033";
       else codec = "avc1.640034";
 
       // Try the chosen codec first, then fall back to the next higher level
       // if the browser's H.264 encoder rejects it.
-      const candidates = ["avc1.640028", "avc1.640032", "avc1.640033", "avc1.640034"];
-      const startIdx = candidates.indexOf(codec);
+      const candidates = ["avc1.640028", "avc1.64002a", "avc1.640032", "avc1.640033", "avc1.640034"];
+      const startIdx = Math.max(0, candidates.indexOf(codec));
       let chosen = null;
       for (let idx = startIdx; idx < candidates.length; idx++) {
-        const cfg = { codec: candidates[idx], width: w, height: h, bitrate, framerate: FPS };
+        const cfg = { codec: candidates[idx], width: w, height: h, bitrate, framerate: fps };
         // eslint-disable-next-line no-await-in-loop
         const sup = await VideoEncoder.isConfigSupported(cfg);
         if (sup && sup.supported) { chosen = cfg; break; }
       }
-      if (!chosen) throw new Error("No supported H.264 config for this resolution.");
+      if (!chosen) throw new Error("No supported H.264 config for this resolution / frame rate.");
       encoder.configure(chosen);
 
-      const frameDurUs = Math.round(1_000_000 / FPS);
+      const frameDurUs = Math.round(1_000_000 / fps);
 
       await renderFrames({
         w, h, N,
         needsPixels: false,
         onFrame: (i, _pixels, canvas) => {
-          const timestamp = Math.round((i * 1_000_000) / FPS);
+          const timestamp = Math.round((i * 1_000_000) / fps);
           const vf = new VideoFrame(canvas, { timestamp, duration: frameDurUs });
           // 1 keyframe per second + first frame, for seekability.
-          encoder.encode(vf, { keyFrame: i === 0 || i % FPS === 0 });
+          encoder.encode(vf, { keyFrame: i === 0 || i % fps === 0 });
           vf.close();
         },
         onStatus: (done, total) => {
@@ -823,7 +834,7 @@
       muxer.finalize();
       const bytes = muxer.target.buffer;
       const blob = new Blob([bytes], { type: "video/mp4" });
-      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_24fps.mp4`;
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps.mp4`;
       triggerDownload(blob, filename);
       toast(`MP4 exported (${formatBytes(blob.size)})`);
     } catch (err) {
@@ -907,6 +918,7 @@
     // Animation controls
     els.animDuration.value = String(state.animDurationSec);
     els.animSize.value = String(state.animSizeP);
+    els.animFps.value = String(state.videoFps);
     updateAnimWarning();
     // Palette controls
     syncPaletteControlsFromState();
@@ -1024,6 +1036,11 @@
     const v = parseInt(e.target.value, 10);
     if (Number.isFinite(v) && v > 0) state.animSizeP = v;
     updateAnimWarning();
+  });
+
+  els.animFps.addEventListener("change", (e) => {
+    const v = parseInt(e.target.value, 10);
+    if (Number.isFinite(v) && v > 0) state.videoFps = v;
   });
 
   els.exportGif.addEventListener("click", exportGIF);
