@@ -327,6 +327,164 @@
   // Animation radius: how far the first domain-warp layer drifts on its circle.
   // 0.35 is organic without losing the seed's identity.
   const ANIM_RADIUS = 0.35;
+
+  // ---- Audio pipeline ----------------------------------------------------
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+  }
+
+  async function loadAudioFile(file) {
+    if (!file) return;
+    if (file.size > 100 * 1024 * 1024) {
+      toast("File too large (max 100 MB).");
+      return;
+    }
+    try {
+      const ctx = getAudioCtx();
+      const arrayBuf = await file.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+      if (decoded.duration > 600) {
+        toast("Audio files longer than 10 minutes aren't supported.");
+        return;
+      }
+      state.audioFile = file;
+      state.audioBuffer = decoded;
+      state.audioTrackDuration = decoded.duration;
+      state.audioStart = Math.min(state.audioStart, Math.max(0, decoded.duration - state.animDurationSec));
+      rebuildAudioLoop();
+      syncControlsFromState();
+      updateExportTooltips();
+      scheduleRender();
+    } catch (err) {
+      console.error(err);
+      toast("Couldn't decode this file — try MP3, WAV, OGG, or M4A.");
+    }
+  }
+
+  function clearAudioFile() {
+    stopAudioPreview();
+    state.audioFile = null;
+    state.audioBuffer = null;
+    state.loopPcmMono = null;
+    state.loopPcmStereo = null;
+    state.features = null;
+    state.audioTrackDuration = 0;
+    state.audioPlaying = false;
+    syncControlsFromState();
+    updateExportTooltips();
+    scheduleRender();
+  }
+
+  function rebuildAudioLoop() {
+    if (!state.audioBuffer) return;
+    const decoded = state.audioBuffer;
+    const channels = [];
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      channels.push(decoded.getChannelData(c));
+    }
+    const mono = MarbleAudio.monoFromStereo(channels);
+    const monoSlice = MarbleAudio.sliceBuffer(mono, decoded.sampleRate, state.audioStart, state.animDurationSec);
+    const monoLoop = MarbleAudio.crossfadeLoop(monoSlice, decoded.sampleRate, 0.030);
+
+    const stereoChannels = [];
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      const ch = MarbleAudio.sliceBuffer(decoded.getChannelData(c), decoded.sampleRate, state.audioStart, state.animDurationSec);
+      stereoChannels.push(MarbleAudio.crossfadeLoop(ch, decoded.sampleRate, 0.030));
+    }
+
+    state.loopPcmMono = monoLoop;
+    state.loopPcmStereo = stereoChannels;
+
+    const N = Math.round(state.animDurationSec * state.videoFps);
+    state.features = MarbleAudio.extractFeatures(monoLoop, decoded.sampleRate, state.videoFps, N);
+  }
+
+  // ---- Audio preview transport -------------------------------------------
+  let audioSource = null;
+  let audioStartTime = 0;
+  let audioRafId = 0;
+
+  function startAudioPreview() {
+    if (!state.loopPcmStereo || !state.features) return;
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume();
+
+    stopAudioPreview();
+
+    const buf = ctx.createBuffer(
+      state.loopPcmStereo.length,
+      state.loopPcmStereo[0].length,
+      state.audioBuffer.sampleRate
+    );
+    for (let c = 0; c < state.loopPcmStereo.length; c++) {
+      buf.copyToChannel(state.loopPcmStereo[c], c);
+    }
+
+    audioSource = ctx.createBufferSource();
+    audioSource.buffer = buf;
+    audioSource.loop = true;
+    audioSource.connect(ctx.destination);
+    audioSource.start();
+    audioStartTime = ctx.currentTime;
+
+    state.audioPlaying = true;
+    els.audioPlay.hidden = true;
+    els.audioPause.hidden = false;
+
+    audioRafId = requestAnimationFrame(audioRenderTick);
+  }
+
+  function stopAudioPreview() {
+    if (audioSource) {
+      try { audioSource.stop(); } catch (_) {}
+      audioSource.disconnect();
+      audioSource = null;
+    }
+    if (audioRafId) {
+      cancelAnimationFrame(audioRafId);
+      audioRafId = 0;
+    }
+    state.audioPlaying = false;
+    els.audioPlay.hidden = false;
+    els.audioPause.hidden = true;
+  }
+
+  function audioRenderTick() {
+    if (!state.audioPlaying || !state.features) return;
+
+    const ctx = getAudioCtx();
+    const loopDur = state.animDurationSec;
+    const fps = state.videoFps;
+    const N = Math.round(loopDur * fps);
+    const t = ((ctx.currentTime - audioStartTime) % loopDur + loopDur) % loopDur;
+    const frameF = t * fps;
+    const i = Math.floor(frameF) % N;
+    const alpha = frameF - Math.floor(frameF);
+    const i1 = (i + 1) % N;
+
+    const feat = {
+      bass: state.features.bass[i] * (1 - alpha) + state.features.bass[i1] * alpha,
+      mid: state.features.mid[i] * (1 - alpha) + state.features.mid[i1] * alpha,
+      treble: state.features.treble[i] * (1 - alpha) + state.features.treble[i1] * alpha,
+      beat: state.features.beat[i] * (1 - alpha) + state.features.beat[i1] * alpha,
+    };
+
+    const r = state.reactivity;
+    const radius = ANIM_RADIUS + 0.25 * feat.bass * r;
+    const scale = state.scale * (1 + 0.08 * feat.mid * r);
+    const phaseKick = 0.15 * feat.beat * r;
+    const colorBias = 0.30 * feat.treble * r;
+
+    const { w, h } = sizePreviewCanvas();
+    const base = offsetsForSeed(state.seed);
+    const offs = animatedOffsets(base, i, N, radius, phaseKick);
+    render(gl, loc, w, h, offs, scale, state.invert, buildPaletteUniform(state), colorBias);
+    updateBadges();
+
+    audioRafId = requestAnimationFrame(audioRenderTick);
+  }
   // GIF is locked to 24 fps because its per-frame delay is an integer in
   // centiseconds — see delayCsForFrame for the alternating 4/5 cs pattern
   // that averages exactly 100/24. MP4 frame rate is user-selectable via
@@ -425,6 +583,12 @@
         for (let i = 0; i < count; i++) state.palette[i] = parts[i];
       }
     }
+
+    const audioStart = parseFloat(p.get("audioStart") || "");
+    if (Number.isFinite(audioStart) && audioStart >= 0) state.audioStart = audioStart;
+
+    const reactivity = parseFloat(p.get("reactivity") || "");
+    if (Number.isFinite(reactivity)) state.reactivity = clamp(reactivity, 0, 1.5);
   }
 
   function writeURL() {
@@ -439,6 +603,8 @@
         .map((h) => (h || "#000000").replace(/^#/, ""));
       p.set("palette", hexes.join("-"));
     }
+    if (state.audioStart > 0) p.set("audioStart", state.audioStart.toFixed(3));
+    if (state.reactivity !== 1.0) p.set("reactivity", state.reactivity.toFixed(2));
     history.replaceState(null, "", `?${p.toString()}`);
   }
 
@@ -744,6 +910,8 @@
       await renderFrames({
         w, h, N,
         needsPixels: true,
+        features: state.features || null,
+        reactivity: state.reactivity,
         onFrame: (i, pixels) => {
           const indexed = applyPalette(pixels, palette, "rgb444");
           gif.writeFrame(indexed, w, h, {
@@ -805,11 +973,20 @@
 
     let encoder = null;
     try {
-      const muxer = new Mp4Muxer.Muxer({
+      const hasAudioTrack = !!(state.loopPcmStereo && "AudioEncoder" in window);
+      const muxerOpts = {
         target: new Mp4Muxer.ArrayBufferTarget(),
         video: { codec: "avc", width: w, height: h, frameRate: fps },
         fastStart: "in-memory",
-      });
+      };
+      if (hasAudioTrack) {
+        muxerOpts.audio = {
+          codec: "aac",
+          numberOfChannels: state.loopPcmStereo.length,
+          sampleRate: state.audioBuffer.sampleRate,
+        };
+      }
+      const muxer = new Mp4Muxer.Muxer(muxerOpts);
 
       encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -851,6 +1028,8 @@
       await renderFrames({
         w, h, N,
         needsPixels: false,
+        features: state.features || null,
+        reactivity: state.reactivity,
         onFrame: (i, _pixels, canvas) => {
           const timestamp = Math.round((i * 1_000_000) / fps);
           const vf = new VideoFrame(canvas, { timestamp, duration: frameDurUs });
@@ -864,12 +1043,55 @@
         },
       });
 
-      setAnimProgress(100, "Finalizing…");
+      setAnimProgress(98, "Finalizing video…");
       await encoder.flush();
+
+      if (hasAudioTrack) {
+        setAnimProgress(99, "Encoding audio…");
+        await new Promise((r) => setTimeout(r, 0));
+        const sr = state.audioBuffer.sampleRate;
+        const numCh = state.loopPcmStereo.length;
+        const numSamples = state.loopPcmStereo[0].length;
+
+        const audioEnc = new AudioEncoder({
+          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+          error: (e) => console.error("AudioEncoder error:", e),
+        });
+        audioEnc.configure({
+          codec: "mp4a.40.2",
+          numberOfChannels: numCh,
+          sampleRate: sr,
+          bitrate: 192000,
+        });
+
+        const frameSize = 1024;
+        for (let off = 0; off < numSamples; off += frameSize) {
+          const count = Math.min(frameSize, numSamples - off);
+          const planarBuf = new Float32Array(count * numCh);
+          for (let c = 0; c < numCh; c++) {
+            planarBuf.set(state.loopPcmStereo[c].subarray(off, off + count), c * count);
+          }
+          const ad = new AudioData({
+            format: "f32-planar",
+            sampleRate: sr,
+            numberOfFrames: count,
+            numberOfChannels: numCh,
+            timestamp: Math.round((off / sr) * 1_000_000),
+            data: planarBuf,
+          });
+          audioEnc.encode(ad);
+          ad.close();
+        }
+        await audioEnc.flush();
+        audioEnc.close();
+      }
+
+      setAnimProgress(100, "Finalizing…");
       muxer.finalize();
       const bytes = muxer.target.buffer;
       const blob = new Blob([bytes], { type: "video/mp4" });
-      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps.mp4`;
+      const suffix = state.features ? "_audio" : "";
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps${suffix}.mp4`;
       triggerDownload(blob, filename);
       toast(`MP4 exported (${formatBytes(blob.size)})`);
     } catch (err) {
@@ -1085,6 +1307,15 @@
   els.animDuration.addEventListener("change", (e) => {
     const v = parseInt(e.target.value, 10);
     if (Number.isFinite(v) && v > 0) state.animDurationSec = v;
+    if (state.audioBuffer) {
+      const maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
+      if (state.audioStart > maxStart) {
+        state.audioStart = maxStart;
+        toast("Start offset clamped to fit loop.");
+      }
+      rebuildAudioLoop();
+      syncControlsFromState();
+    }
   });
 
   els.animSize.addEventListener("change", (e) => {
@@ -1096,6 +1327,43 @@
   els.animFps.addEventListener("change", (e) => {
     const v = parseInt(e.target.value, 10);
     if (Number.isFinite(v) && v > 0) state.videoFps = v;
+    if (state.audioBuffer) rebuildAudioLoop();
+  });
+
+  els.audioFileInput.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) loadAudioFile(file);
+  });
+
+  els.audioClear.addEventListener("click", clearAudioFile);
+
+  els.audioStart.addEventListener("input", (e) => {
+    state.audioStart = parseFloat(e.target.value) || 0;
+    els.audioStartReadout.textContent = formatTime(state.audioStart);
+    rebuildAudioLoop();
+    if (state.audioPlaying) {
+      stopAudioPreview();
+      startAudioPreview();
+    }
+    scheduleRender();
+  });
+
+  els.audioReactivity.addEventListener("input", (e) => {
+    state.reactivity = parseFloat(e.target.value) || 1.0;
+    els.audioReactivityReadout.textContent = state.reactivity.toFixed(2);
+  });
+
+  els.audioPlay.addEventListener("click", startAudioPreview);
+  els.audioPause.addEventListener("click", stopAudioPreview);
+
+  els.canvas.parentElement.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  els.canvas.parentElement.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file && file.type.startsWith("audio/")) loadAudioFile(file);
   });
 
   els.exportGif.addEventListener("click", exportGIF);
@@ -1106,7 +1374,29 @@
     els.exportMp4.hidden = true;
   }
 
+  // Audio capability gate
+  if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") {
+    els.audioFileInput.disabled = true;
+    els.audioFileName.textContent = "Audio requires a modern browser";
+  }
+
+  function updateExportTooltips() {
+    const hasAudio = !!state.audioFile;
+    els.exportGif.title = hasAudio
+      ? "Export looping GIF (silent — GIF has no audio)"
+      : "Export looping GIF at 24 fps";
+    els.exportMp4.title = hasAudio
+      ? "Export looping MP4 with embedded audio"
+      : "Export looping MP4 video at the selected frame rate";
+  }
+
   els.share.addEventListener("click", async () => {
+    if (state.audioFile) {
+      toast("Share captures visual settings but not the audio file — export the MP4 to share with audio.");
+      writeURL();
+      try { await navigator.clipboard.writeText(location.href); } catch (_) {}
+      return;
+    }
     writeURL();
     const url = location.href;
     try {
