@@ -623,7 +623,7 @@
   // Shared frame generator. Renders N frames of the perfectly-looping
   // animation into a dedicated offscreen WebGL context, calling `onFrame`
   // with either a pixel buffer (for GIF) or the canvas itself (for MP4).
-  async function renderFrames({ w, h, N, needsPixels, onFrame, onStatus }) {
+  async function renderFrames({ w, h, N, needsPixels, onFrame, onStatus, features, reactivity }) {
     const off = document.createElement("canvas");
     off.width = w;
     off.height = h;
@@ -641,8 +641,19 @@
     const flipBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
 
     for (let i = 0; i < N; i++) {
-      const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
-      render(ogl, oloc, w, h, offs, state.scale, state.invert, paletteOpts);
+      let radius = ANIM_RADIUS;
+      let scale = state.scale;
+      let phaseKick = 0;
+      let colorBias = 0;
+      if (features) {
+        const r = reactivity || 1.0;
+        radius = ANIM_RADIUS + 0.25 * features.bass[i] * r;
+        scale = state.scale * (1 + 0.08 * features.mid[i] * r);
+        phaseKick = 0.15 * features.beat[i] * r;
+        colorBias = 0.30 * features.treble[i] * r;
+      }
+      const offs = animatedOffsets(base, i, N, radius, phaseKick);
+      render(ogl, oloc, w, h, offs, scale, state.invert, paletteOpts, colorBias);
       if (needsPixels) {
         ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
         flipRowsRGBA(readBuf, w, h, flipBuf);
