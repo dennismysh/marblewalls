@@ -24,6 +24,7 @@
     uniform float u_useCustomPalette;
     uniform int   u_paletteCount;
     uniform vec3  u_palette[8];
+    uniform float u_colorBias;
 
     float fbm5(vec2 p) {
       float val = 0.0;
@@ -82,10 +83,11 @@
       float wm = sqrt(wx3 * wx3 + wy3 * wy3) * 0.2;
 
       const float PI = 3.14159265358979;
-      float sR  = sin(f * PI * 2.0 + wm * 2.0);
-      float sG  = sin(g * PI * 3.0 + f * 2.0);
+      float fb  = f + u_colorBias;
+      float sR  = sin(fb * PI * 2.0 + wm * 2.0);
+      float sG  = sin(g * PI * 3.0 + fb * 2.0);
       float sGw = sin(wm * 4.0);
-      float sB  = sin(f * PI * 1.5 + g * PI + 1.0);
+      float sB  = sin(fb * PI * 1.5 + g * PI + 1.0);
 
       float r  = clamp(0.30 + 0.70 * sR * sR, 0.0, 1.0);
       float gc = clamp(0.20 + 0.60 * sG * sG + 0.20 * sGw * sGw, 0.0, 1.0);
@@ -97,7 +99,7 @@
       // Drive it with the same noise 'f' that informs the procedural palette,
       // plus a dash of 'wm' so bands follow the marble's domain warping.
       if (u_useCustomPalette > 0.5) {
-        float t = clamp(f + wm * 0.1, 0.0, 1.0);
+        float t = clamp(f + u_colorBias + wm * 0.1, 0.0, 1.0);
         float idx = t * float(u_paletteCount - 1);
         float idx0 = floor(idx);
         float idx1 = min(idx0 + 1.0, float(u_paletteCount - 1));
@@ -204,10 +206,11 @@
       uUseCustomPalette: gl.getUniformLocation(prog, "u_useCustomPalette"),
       uPaletteCount: gl.getUniformLocation(prog, "u_paletteCount"),
       uPalette: gl.getUniformLocation(prog, "u_palette[0]"),
+      uColorBias: gl.getUniformLocation(prog, "u_colorBias"),
     };
   }
 
-  function render(gl, loc, width, height, offsets, scale, invert, paletteOpts) {
+  function render(gl, loc, width, height, offsets, scale, invert, paletteOpts, colorBias) {
     gl.viewport(0, 0, width, height);
     gl.useProgram(loc.prog);
     gl.uniform2f(loc.uRes, width, height);
@@ -218,6 +221,7 @@
     gl.uniform1f(loc.uUseCustomPalette, po.use ? 1.0 : 0.0);
     gl.uniform1i(loc.uPaletteCount, po.count);
     gl.uniform3fv(loc.uPalette, po.colors);
+    gl.uniform1f(loc.uColorBias, colorBias || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
@@ -265,6 +269,17 @@
     animProgress: $("#anim-progress"),
     animProgressBar: $("#anim-progress-bar"),
     animProgressLabel: $("#anim-progress-label"),
+    audioFileInput: $("#audio-file"),
+    audioFileName: $("#audio-file-name"),
+    audioClear: $("#audio-clear"),
+    audioControls: $("#audio-controls"),
+    audioStart: $("#audio-start"),
+    audioStartReadout: $("#audio-start-readout"),
+    audioReactivity: $("#audio-reactivity"),
+    audioReactivityReadout: $("#audio-reactivity-readout"),
+    audioPlay: $("#audio-play"),
+    audioPause: $("#audio-pause"),
+    audioBadge: $("#audio-badge"),
   };
 
   // Preview GL context + program
@@ -298,6 +313,15 @@
     useCustomPalette: false,
     paletteCount: 4,
     palette: DEFAULT_PALETTE.slice(),
+    audioFile: null,
+    audioBuffer: null,
+    loopPcmMono: null,
+    loopPcmStereo: null,
+    features: null,
+    audioStart: 0,
+    audioTrackDuration: 0,
+    reactivity: 1.0,
+    audioPlaying: false,
   };
 
   // Animation radius: how far the first domain-warp layer drifts on its circle.
@@ -523,9 +547,9 @@
   // (o0..o3). Because cos/sin are 2π-periodic, frame 0 and frame N are
   // byte-identical — no seam when wrapping.
 
-  function animatedOffsets(base, i, N, radius) {
+  function animatedOffsets(base, i, N, radius, phaseOffset) {
     const out = new Float32Array(12);
-    const t = (2 * Math.PI * i) / N;
+    const t = (2 * Math.PI * i) / N + (phaseOffset || 0);
     const r = radius || ANIM_RADIUS;
     const cosT = Math.cos(t);
     const sinT = Math.sin(t);
@@ -849,6 +873,12 @@
     }
   }
 
+  function formatTime(sec) {
+    var m = Math.floor(sec / 60);
+    var s = sec - m * 60;
+    return m + ":" + s.toFixed(2).padStart(5, "0");
+  }
+
   function formatBytes(n) {
     if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + " GB";
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + " MB";
@@ -920,6 +950,20 @@
     els.animSize.value = String(state.animSizeP);
     els.animFps.value = String(state.videoFps);
     updateAnimWarning();
+    // Audio controls
+    var hasAudio = !!state.audioFile;
+    els.audioControls.hidden = !hasAudio;
+    els.audioClear.hidden = !hasAudio;
+    els.audioBadge.hidden = !hasAudio;
+    els.audioFileName.textContent = hasAudio ? state.audioFile.name : "No file";
+    els.audioReactivity.value = state.reactivity;
+    els.audioReactivityReadout.textContent = state.reactivity.toFixed(2);
+    if (hasAudio && state.audioTrackDuration > 0) {
+      var maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
+      els.audioStart.max = maxStart;
+      els.audioStart.value = state.audioStart;
+      els.audioStartReadout.textContent = formatTime(state.audioStart);
+    }
     // Palette controls
     syncPaletteControlsFromState();
   }
