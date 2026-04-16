@@ -24,6 +24,7 @@
     uniform float u_useCustomPalette;
     uniform int   u_paletteCount;
     uniform vec3  u_palette[8];
+    uniform float u_colorBias;
 
     float fbm5(vec2 p) {
       float val = 0.0;
@@ -82,10 +83,11 @@
       float wm = sqrt(wx3 * wx3 + wy3 * wy3) * 0.2;
 
       const float PI = 3.14159265358979;
-      float sR  = sin(f * PI * 2.0 + wm * 2.0);
-      float sG  = sin(g * PI * 3.0 + f * 2.0);
+      float fb  = f + u_colorBias;
+      float sR  = sin(fb * PI * 2.0 + wm * 2.0);
+      float sG  = sin(g * PI * 3.0 + fb * 2.0);
       float sGw = sin(wm * 4.0);
-      float sB  = sin(f * PI * 1.5 + g * PI + 1.0);
+      float sB  = sin(fb * PI * 1.5 + g * PI + 1.0);
 
       float r  = clamp(0.30 + 0.70 * sR * sR, 0.0, 1.0);
       float gc = clamp(0.20 + 0.60 * sG * sG + 0.20 * sGw * sGw, 0.0, 1.0);
@@ -97,7 +99,7 @@
       // Drive it with the same noise 'f' that informs the procedural palette,
       // plus a dash of 'wm' so bands follow the marble's domain warping.
       if (u_useCustomPalette > 0.5) {
-        float t = clamp(f + wm * 0.1, 0.0, 1.0);
+        float t = clamp(f + u_colorBias + wm * 0.1, 0.0, 1.0);
         float idx = t * float(u_paletteCount - 1);
         float idx0 = floor(idx);
         float idx1 = min(idx0 + 1.0, float(u_paletteCount - 1));
@@ -204,10 +206,11 @@
       uUseCustomPalette: gl.getUniformLocation(prog, "u_useCustomPalette"),
       uPaletteCount: gl.getUniformLocation(prog, "u_paletteCount"),
       uPalette: gl.getUniformLocation(prog, "u_palette[0]"),
+      uColorBias: gl.getUniformLocation(prog, "u_colorBias"),
     };
   }
 
-  function render(gl, loc, width, height, offsets, scale, invert, paletteOpts) {
+  function render(gl, loc, width, height, offsets, scale, invert, paletteOpts, colorBias) {
     gl.viewport(0, 0, width, height);
     gl.useProgram(loc.prog);
     gl.uniform2f(loc.uRes, width, height);
@@ -218,6 +221,7 @@
     gl.uniform1f(loc.uUseCustomPalette, po.use ? 1.0 : 0.0);
     gl.uniform1i(loc.uPaletteCount, po.count);
     gl.uniform3fv(loc.uPalette, po.colors);
+    gl.uniform1f(loc.uColorBias, colorBias || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
@@ -265,6 +269,17 @@
     animProgress: $("#anim-progress"),
     animProgressBar: $("#anim-progress-bar"),
     animProgressLabel: $("#anim-progress-label"),
+    audioFileInput: $("#audio-file"),
+    audioFileName: $("#audio-file-name"),
+    audioClear: $("#audio-clear"),
+    audioControls: $("#audio-controls"),
+    audioStart: $("#audio-start"),
+    audioStartReadout: $("#audio-start-readout"),
+    audioReactivity: $("#audio-reactivity"),
+    audioReactivityReadout: $("#audio-reactivity-readout"),
+    audioPlay: $("#audio-play"),
+    audioPause: $("#audio-pause"),
+    audioBadge: $("#audio-badge"),
   };
 
   // Preview GL context + program
@@ -298,11 +313,178 @@
     useCustomPalette: false,
     paletteCount: 4,
     palette: DEFAULT_PALETTE.slice(),
+    audioFile: null,
+    audioBuffer: null,
+    loopPcmMono: null,
+    loopPcmStereo: null,
+    features: null,
+    audioStart: 0,
+    audioTrackDuration: 0,
+    reactivity: 1.0,
+    audioPlaying: false,
   };
 
   // Animation radius: how far the first domain-warp layer drifts on its circle.
   // 0.35 is organic without losing the seed's identity.
   const ANIM_RADIUS = 0.35;
+
+  // ---- Audio pipeline ----------------------------------------------------
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+  }
+
+  async function loadAudioFile(file) {
+    if (!file) return;
+    if (file.size > 100 * 1024 * 1024) {
+      toast("File too large (max 100 MB).");
+      return;
+    }
+    try {
+      const ctx = getAudioCtx();
+      const arrayBuf = await file.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+      if (decoded.duration > 600) {
+        toast("Audio files longer than 10 minutes aren't supported.");
+        return;
+      }
+      state.audioFile = file;
+      state.audioBuffer = decoded;
+      state.audioTrackDuration = decoded.duration;
+      state.audioStart = Math.min(state.audioStart, Math.max(0, decoded.duration - state.animDurationSec));
+      rebuildAudioLoop();
+      syncControlsFromState();
+      updateExportTooltips();
+      scheduleRender();
+    } catch (err) {
+      console.error(err);
+      toast("Couldn't decode this file — try MP3, WAV, OGG, or M4A.");
+    }
+  }
+
+  function clearAudioFile() {
+    stopAudioPreview();
+    state.audioFile = null;
+    state.audioBuffer = null;
+    state.loopPcmMono = null;
+    state.loopPcmStereo = null;
+    state.features = null;
+    state.audioTrackDuration = 0;
+    state.audioPlaying = false;
+    syncControlsFromState();
+    updateExportTooltips();
+    scheduleRender();
+  }
+
+  function rebuildAudioLoop() {
+    if (!state.audioBuffer) return;
+    const decoded = state.audioBuffer;
+    const channels = [];
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      channels.push(decoded.getChannelData(c));
+    }
+    const mono = MarbleAudio.monoFromStereo(channels);
+    const monoSlice = MarbleAudio.sliceBuffer(mono, decoded.sampleRate, state.audioStart, state.animDurationSec);
+    const monoLoop = MarbleAudio.crossfadeLoop(monoSlice, decoded.sampleRate, 0.030);
+
+    const stereoChannels = [];
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      const ch = MarbleAudio.sliceBuffer(decoded.getChannelData(c), decoded.sampleRate, state.audioStart, state.animDurationSec);
+      stereoChannels.push(MarbleAudio.crossfadeLoop(ch, decoded.sampleRate, 0.030));
+    }
+
+    state.loopPcmMono = monoLoop;
+    state.loopPcmStereo = stereoChannels;
+
+    const N = Math.round(state.animDurationSec * state.videoFps);
+    state.features = MarbleAudio.extractFeatures(monoLoop, decoded.sampleRate, state.videoFps, N);
+  }
+
+  // ---- Audio preview transport -------------------------------------------
+  let audioSource = null;
+  let audioStartTime = 0;
+  let audioRafId = 0;
+
+  function startAudioPreview() {
+    if (!state.loopPcmStereo || !state.features) return;
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume();
+
+    stopAudioPreview();
+
+    const buf = ctx.createBuffer(
+      state.loopPcmStereo.length,
+      state.loopPcmStereo[0].length,
+      state.audioBuffer.sampleRate
+    );
+    for (let c = 0; c < state.loopPcmStereo.length; c++) {
+      buf.copyToChannel(state.loopPcmStereo[c], c);
+    }
+
+    audioSource = ctx.createBufferSource();
+    audioSource.buffer = buf;
+    audioSource.loop = true;
+    audioSource.connect(ctx.destination);
+    audioSource.start();
+    audioStartTime = ctx.currentTime;
+
+    state.audioPlaying = true;
+    els.audioPlay.hidden = true;
+    els.audioPause.hidden = false;
+
+    audioRafId = requestAnimationFrame(audioRenderTick);
+  }
+
+  function stopAudioPreview() {
+    if (audioSource) {
+      try { audioSource.stop(); } catch (_) {}
+      audioSource.disconnect();
+      audioSource = null;
+    }
+    if (audioRafId) {
+      cancelAnimationFrame(audioRafId);
+      audioRafId = 0;
+    }
+    state.audioPlaying = false;
+    els.audioPlay.hidden = false;
+    els.audioPause.hidden = true;
+  }
+
+  function audioRenderTick() {
+    if (!state.audioPlaying || !state.features) return;
+
+    const ctx = getAudioCtx();
+    const loopDur = state.animDurationSec;
+    const fps = state.videoFps;
+    const N = Math.round(loopDur * fps);
+    const t = ((ctx.currentTime - audioStartTime) % loopDur + loopDur) % loopDur;
+    const frameF = t * fps;
+    const i = Math.floor(frameF) % N;
+    const alpha = frameF - Math.floor(frameF);
+    const i1 = (i + 1) % N;
+
+    const feat = {
+      bass: state.features.bass[i] * (1 - alpha) + state.features.bass[i1] * alpha,
+      mid: state.features.mid[i] * (1 - alpha) + state.features.mid[i1] * alpha,
+      treble: state.features.treble[i] * (1 - alpha) + state.features.treble[i1] * alpha,
+      beat: state.features.beat[i] * (1 - alpha) + state.features.beat[i1] * alpha,
+    };
+
+    const r = state.reactivity;
+    const radius = ANIM_RADIUS + 0.25 * feat.bass * r;
+    const scale = state.scale * (1 + 0.08 * feat.mid * r);
+    const phaseKick = 0.15 * feat.beat * r;
+    const colorBias = 0.30 * feat.treble * r;
+
+    const { w, h } = sizePreviewCanvas();
+    const base = offsetsForSeed(state.seed);
+    const offs = animatedOffsets(base, i, N, radius, phaseKick);
+    render(gl, loc, w, h, offs, scale, state.invert, buildPaletteUniform(state), colorBias);
+    updateBadges();
+
+    audioRafId = requestAnimationFrame(audioRenderTick);
+  }
   // GIF is locked to 24 fps because its per-frame delay is an integer in
   // centiseconds — see delayCsForFrame for the alternating 4/5 cs pattern
   // that averages exactly 100/24. MP4 frame rate is user-selectable via
@@ -401,6 +583,12 @@
         for (let i = 0; i < count; i++) state.palette[i] = parts[i];
       }
     }
+
+    const audioStart = parseFloat(p.get("audioStart") || "");
+    if (Number.isFinite(audioStart) && audioStart >= 0) state.audioStart = audioStart;
+
+    const reactivity = parseFloat(p.get("reactivity") || "");
+    if (Number.isFinite(reactivity)) state.reactivity = clamp(reactivity, 0, 1.5);
   }
 
   function writeURL() {
@@ -415,6 +603,8 @@
         .map((h) => (h || "#000000").replace(/^#/, ""));
       p.set("palette", hexes.join("-"));
     }
+    if (state.audioStart > 0) p.set("audioStart", state.audioStart.toFixed(3));
+    if (state.reactivity !== 1.0) p.set("reactivity", state.reactivity.toFixed(2));
     history.replaceState(null, "", `?${p.toString()}`);
   }
 
@@ -523,9 +713,9 @@
   // (o0..o3). Because cos/sin are 2π-periodic, frame 0 and frame N are
   // byte-identical — no seam when wrapping.
 
-  function animatedOffsets(base, i, N, radius) {
+  function animatedOffsets(base, i, N, radius, phaseOffset) {
     const out = new Float32Array(12);
-    const t = (2 * Math.PI * i) / N;
+    const t = (2 * Math.PI * i) / N + (phaseOffset || 0);
     const r = radius || ANIM_RADIUS;
     const cosT = Math.cos(t);
     const sinT = Math.sin(t);
@@ -599,7 +789,7 @@
   // Shared frame generator. Renders N frames of the perfectly-looping
   // animation into a dedicated offscreen WebGL context, calling `onFrame`
   // with either a pixel buffer (for GIF) or the canvas itself (for MP4).
-  async function renderFrames({ w, h, N, needsPixels, onFrame, onStatus }) {
+  async function renderFrames({ w, h, N, needsPixels, onFrame, onStatus, features, reactivity }) {
     const off = document.createElement("canvas");
     off.width = w;
     off.height = h;
@@ -617,8 +807,19 @@
     const flipBuf = needsPixels ? new Uint8Array(w * h * 4) : null;
 
     for (let i = 0; i < N; i++) {
-      const offs = animatedOffsets(base, i, N, ANIM_RADIUS);
-      render(ogl, oloc, w, h, offs, state.scale, state.invert, paletteOpts);
+      let radius = ANIM_RADIUS;
+      let scale = state.scale;
+      let phaseKick = 0;
+      let colorBias = 0;
+      if (features) {
+        const r = reactivity || 1.0;
+        radius = ANIM_RADIUS + 0.25 * features.bass[i] * r;
+        scale = state.scale * (1 + 0.08 * features.mid[i] * r);
+        phaseKick = 0.15 * features.beat[i] * r;
+        colorBias = 0.30 * features.treble[i] * r;
+      }
+      const offs = animatedOffsets(base, i, N, radius, phaseKick);
+      render(ogl, oloc, w, h, offs, scale, state.invert, paletteOpts, colorBias);
       if (needsPixels) {
         ogl.readPixels(0, 0, w, h, ogl.RGBA, ogl.UNSIGNED_BYTE, readBuf);
         flipRowsRGBA(readBuf, w, h, flipBuf);
@@ -709,6 +910,8 @@
       await renderFrames({
         w, h, N,
         needsPixels: true,
+        features: state.features || null,
+        reactivity: state.reactivity,
         onFrame: (i, pixels) => {
           const indexed = applyPalette(pixels, palette, "rgb444");
           gif.writeFrame(indexed, w, h, {
@@ -770,11 +973,20 @@
 
     let encoder = null;
     try {
-      const muxer = new Mp4Muxer.Muxer({
+      const hasAudioTrack = !!(state.loopPcmStereo && "AudioEncoder" in window);
+      const muxerOpts = {
         target: new Mp4Muxer.ArrayBufferTarget(),
         video: { codec: "avc", width: w, height: h, frameRate: fps },
         fastStart: "in-memory",
-      });
+      };
+      if (hasAudioTrack) {
+        muxerOpts.audio = {
+          codec: "aac",
+          numberOfChannels: state.loopPcmStereo.length,
+          sampleRate: state.audioBuffer.sampleRate,
+        };
+      }
+      const muxer = new Mp4Muxer.Muxer(muxerOpts);
 
       encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -816,6 +1028,8 @@
       await renderFrames({
         w, h, N,
         needsPixels: false,
+        features: state.features || null,
+        reactivity: state.reactivity,
         onFrame: (i, _pixels, canvas) => {
           const timestamp = Math.round((i * 1_000_000) / fps);
           const vf = new VideoFrame(canvas, { timestamp, duration: frameDurUs });
@@ -829,12 +1043,55 @@
         },
       });
 
-      setAnimProgress(100, "Finalizing…");
+      setAnimProgress(98, "Finalizing video…");
       await encoder.flush();
+
+      if (hasAudioTrack) {
+        setAnimProgress(99, "Encoding audio…");
+        await new Promise((r) => setTimeout(r, 0));
+        const sr = state.audioBuffer.sampleRate;
+        const numCh = state.loopPcmStereo.length;
+        const numSamples = state.loopPcmStereo[0].length;
+
+        const audioEnc = new AudioEncoder({
+          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+          error: (e) => console.error("AudioEncoder error:", e),
+        });
+        audioEnc.configure({
+          codec: "mp4a.40.2",
+          numberOfChannels: numCh,
+          sampleRate: sr,
+          bitrate: 192000,
+        });
+
+        const frameSize = 1024;
+        for (let off = 0; off < numSamples; off += frameSize) {
+          const count = Math.min(frameSize, numSamples - off);
+          const planarBuf = new Float32Array(count * numCh);
+          for (let c = 0; c < numCh; c++) {
+            planarBuf.set(state.loopPcmStereo[c].subarray(off, off + count), c * count);
+          }
+          const ad = new AudioData({
+            format: "f32-planar",
+            sampleRate: sr,
+            numberOfFrames: count,
+            numberOfChannels: numCh,
+            timestamp: Math.round((off / sr) * 1_000_000),
+            data: planarBuf,
+          });
+          audioEnc.encode(ad);
+          ad.close();
+        }
+        await audioEnc.flush();
+        audioEnc.close();
+      }
+
+      setAnimProgress(100, "Finalizing…");
       muxer.finalize();
       const bytes = muxer.target.buffer;
       const blob = new Blob([bytes], { type: "video/mp4" });
-      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps.mp4`;
+      const suffix = state.features ? "_audio" : "";
+      const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps${suffix}.mp4`;
       triggerDownload(blob, filename);
       toast(`MP4 exported (${formatBytes(blob.size)})`);
     } catch (err) {
@@ -847,6 +1104,12 @@
       hideAnimProgress();
       setExportButtonsDisabled(false);
     }
+  }
+
+  function formatTime(sec) {
+    var m = Math.floor(sec / 60);
+    var s = sec - m * 60;
+    return m + ":" + s.toFixed(2).padStart(5, "0");
   }
 
   function formatBytes(n) {
@@ -920,6 +1183,20 @@
     els.animSize.value = String(state.animSizeP);
     els.animFps.value = String(state.videoFps);
     updateAnimWarning();
+    // Audio controls
+    var hasAudio = !!state.audioFile;
+    els.audioControls.hidden = !hasAudio;
+    els.audioClear.hidden = !hasAudio;
+    els.audioBadge.hidden = !hasAudio;
+    els.audioFileName.textContent = hasAudio ? state.audioFile.name : "No file";
+    els.audioReactivity.value = state.reactivity;
+    els.audioReactivityReadout.textContent = state.reactivity.toFixed(2);
+    if (hasAudio && state.audioTrackDuration > 0) {
+      var maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
+      els.audioStart.max = maxStart;
+      els.audioStart.value = state.audioStart;
+      els.audioStartReadout.textContent = formatTime(state.audioStart);
+    }
     // Palette controls
     syncPaletteControlsFromState();
   }
@@ -1030,6 +1307,15 @@
   els.animDuration.addEventListener("change", (e) => {
     const v = parseInt(e.target.value, 10);
     if (Number.isFinite(v) && v > 0) state.animDurationSec = v;
+    if (state.audioBuffer) {
+      const maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
+      if (state.audioStart > maxStart) {
+        state.audioStart = maxStart;
+        toast("Start offset clamped to fit loop.");
+      }
+      rebuildAudioLoop();
+      syncControlsFromState();
+    }
   });
 
   els.animSize.addEventListener("change", (e) => {
@@ -1041,6 +1327,43 @@
   els.animFps.addEventListener("change", (e) => {
     const v = parseInt(e.target.value, 10);
     if (Number.isFinite(v) && v > 0) state.videoFps = v;
+    if (state.audioBuffer) rebuildAudioLoop();
+  });
+
+  els.audioFileInput.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) loadAudioFile(file);
+  });
+
+  els.audioClear.addEventListener("click", clearAudioFile);
+
+  els.audioStart.addEventListener("input", (e) => {
+    state.audioStart = parseFloat(e.target.value) || 0;
+    els.audioStartReadout.textContent = formatTime(state.audioStart);
+    rebuildAudioLoop();
+    if (state.audioPlaying) {
+      stopAudioPreview();
+      startAudioPreview();
+    }
+    scheduleRender();
+  });
+
+  els.audioReactivity.addEventListener("input", (e) => {
+    state.reactivity = parseFloat(e.target.value) || 1.0;
+    els.audioReactivityReadout.textContent = state.reactivity.toFixed(2);
+  });
+
+  els.audioPlay.addEventListener("click", startAudioPreview);
+  els.audioPause.addEventListener("click", stopAudioPreview);
+
+  els.canvas.parentElement.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  els.canvas.parentElement.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file && file.type.startsWith("audio/")) loadAudioFile(file);
   });
 
   els.exportGif.addEventListener("click", exportGIF);
@@ -1051,7 +1374,29 @@
     els.exportMp4.hidden = true;
   }
 
+  // Audio capability gate
+  if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") {
+    els.audioFileInput.disabled = true;
+    els.audioFileName.textContent = "Audio requires a modern browser";
+  }
+
+  function updateExportTooltips() {
+    const hasAudio = !!state.audioFile;
+    els.exportGif.title = hasAudio
+      ? "Export looping GIF (silent — GIF has no audio)"
+      : "Export looping GIF at 24 fps";
+    els.exportMp4.title = hasAudio
+      ? "Export looping MP4 with embedded audio"
+      : "Export looping MP4 video at the selected frame rate";
+  }
+
   els.share.addEventListener("click", async () => {
+    if (state.audioFile) {
+      toast("Share captures visual settings but not the audio file — export the MP4 to share with audio.");
+      writeURL();
+      try { await navigator.clipboard.writeText(location.href); } catch (_) {}
+      return;
+    }
     writeURL();
     const url = location.href;
     try {

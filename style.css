@@ -387,6 +387,43 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text);
 }
 
+.audio-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.audio-file-input {
+  max-width: 140px;
+  font-size: 12px;
+}
+.audio-file-name {
+  font-size: 13px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.btn-small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.audio-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.audio-readout {
+  float: right;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.audio-transport {
+  gap: 8px;
+}
+
 .anim-progress {
   display: flex;
   flex-direction: column;
