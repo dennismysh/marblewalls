@@ -30,6 +30,7 @@
       <div class="stage-meta">
         <span id="seed-badge" class="badge">seed 0</span>
         <span id="size-badge" class="badge">1920 × 1080</span>
+        <span id="audio-badge" class="badge" hidden>&#9835; audio</span>
       </div>
     </section>
 
@@ -121,6 +122,29 @@
         </button>
       </div>
 
+      <div class="field audio-field" id="audio-field">
+        <label>Audio</label>
+        <div class="audio-file-row">
+          <input id="audio-file" type="file" accept="audio/*" class="audio-file-input" />
+          <span id="audio-file-name" class="audio-file-name">No file</span>
+          <button id="audio-clear" class="btn btn-small" type="button" hidden>Clear</button>
+        </div>
+        <div class="audio-controls" id="audio-controls" hidden>
+          <div class="field">
+            <label for="audio-start">Start offset <span id="audio-start-readout" class="audio-readout">0:00.00</span></label>
+            <input id="audio-start" type="range" min="0" max="1" step="0.01" value="0" />
+          </div>
+          <div class="field">
+            <label for="audio-reactivity">Reactivity <span id="audio-reactivity-readout" class="audio-readout">1.00</span></label>
+            <input id="audio-reactivity" type="range" min="0" max="1.5" step="0.01" value="1" />
+          </div>
+          <div class="row audio-transport">
+            <button id="audio-play" class="btn" type="button">Play</button>
+            <button id="audio-pause" class="btn" type="button" hidden>Pause</button>
+          </div>
+        </div>
+      </div>
+
       <div class="field anim-field">
         <label>Looping animation</label>
         <div class="row anim-row">
@@ -129,6 +153,8 @@
             <option value="4" selected>4 s</option>
             <option value="6">6 s</option>
             <option value="8">8 s</option>
+            <option value="12">12 s</option>
+            <option value="16">16 s</option>
           </select>
           <select id="anim-size" aria-label="Animation output size">
             <option value="480">480p</option>
@@ -178,6 +204,8 @@
     <span>Rendered on your GPU with WebGL · No servers, no tracking.</span>
   </footer>
 
+  <script src="fft.js"></script>
+  <script src="audio.js"></script>
   <script src="vendor/gifenc/gifenc.js"></script>
   <script src="vendor/mp4-muxer/mp4-muxer.js"></script>
   <script src="app.js"></script>
