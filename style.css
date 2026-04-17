@@ -571,3 +571,39 @@ input[type="range"]::-moz-range-thumb {
   border: none;
   border-radius: 8px;
 }
+
+.audio-source-toggle {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.btn-toggle {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 12px;
+  text-align: center;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  cursor: pointer;
+}
+.btn-toggle.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.instrument-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.instrument-toggles label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.instrument-toggles input[type="checkbox"] {
+  accent-color: var(--accent);
+}

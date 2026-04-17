@@ -280,6 +280,16 @@
     audioPlay: $("#audio-play"),
     audioPause: $("#audio-pause"),
     audioBadge: $("#audio-badge"),
+    sourceFile: $("#source-file"),
+    sourceGen: $("#source-gen"),
+    audioFileView: $("#audio-file-view"),
+    audioGenView: $("#audio-gen-view"),
+    genGenre: $("#gen-genre"),
+    genBpm: $("#gen-bpm"),
+    genBpmReadout: $("#gen-bpm-readout"),
+    genBars: $("#gen-bars"),
+    genInstrumentToggles: $("#instrument-toggles"),
+    genRandomize: $("#gen-randomize"),
   };
 
   // Preview GL context + program
@@ -322,6 +332,12 @@
     audioTrackDuration: 0,
     reactivity: 1.0,
     audioPlaying: false,
+    audioSource: "generator",
+    genreId: "lofi",
+    genBpm: 85,
+    genBars: 4,
+    genInstruments: {},
+    genVariationSeed: 0,
   };
 
   // Animation radius: how far the first domain-warp layer drifts on its circle.
@@ -375,6 +391,98 @@
     syncControlsFromState();
     updateExportTooltips();
     scheduleRender();
+  }
+
+  function setAudioSource(source) {
+    stopAudioPreview();
+    state.audioSource = source;
+    if (source === "file") {
+      clearGeneratorState();
+      els.audioFileView.hidden = false;
+      els.audioGenView.hidden = true;
+      els.sourceFile.classList.add("active");
+      els.sourceGen.classList.remove("active");
+    } else {
+      clearAudioFile();
+      els.audioFileView.hidden = true;
+      els.audioGenView.hidden = false;
+      els.sourceFile.classList.remove("active");
+      els.sourceGen.classList.add("active");
+      generateAndLoadBeat();
+    }
+    updateExportTooltips();
+    syncControlsFromState();
+  }
+
+  function clearGeneratorState() {
+    state.loopPcmMono = null;
+    state.loopPcmStereo = null;
+    state.features = null;
+  }
+
+  function initGenreDefaults(genreId) {
+    var genre = MarbleSequencer.GENRES[genreId];
+    if (!genre) return;
+    state.genreId = genreId;
+    state.genBpm = genre.bpm;
+    state.genInstruments = {};
+    for (var name in genre.instruments) {
+      state.genInstruments[name] = genre.instruments[name].enabled;
+    }
+  }
+
+  async function generateAndLoadBeat() {
+    var genre = MarbleSequencer.GENRES[state.genreId];
+    if (!genre) return;
+    try {
+      var buffer = await MarbleSequencer.renderBeat(
+        genre, state.genBpm, state.genBars,
+        state.genInstruments, state.genVariationSeed
+      );
+      state.audioBuffer = buffer;
+      state.audioTrackDuration = buffer.duration;
+
+      var channels = [];
+      for (var c = 0; c < buffer.numberOfChannels; c++) {
+        channels.push(new Float32Array(buffer.getChannelData(c)));
+      }
+      state.loopPcmStereo = channels;
+      state.loopPcmMono = MarbleAudio.monoFromStereo(channels);
+
+      var dur = MarbleSequencer.computeLoopDuration(state.genBpm, state.genBars);
+      var N = Math.round(dur * state.videoFps);
+      state.features = MarbleAudio.extractFeatures(state.loopPcmMono, buffer.sampleRate, state.videoFps, N);
+      state.animDurationSec = dur;
+
+      syncControlsFromState();
+      scheduleRender();
+    } catch (err) {
+      console.error(err);
+      toast("Beat generation failed — try a different browser.");
+    }
+  }
+
+  function buildInstrumentToggles() {
+    var genre = MarbleSequencer.GENRES[state.genreId];
+    if (!genre) return;
+    var container = els.genInstrumentToggles;
+    container.innerHTML = "";
+    for (var name in genre.instruments) {
+      var label = document.createElement("label");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !!state.genInstruments[name];
+      cb.dataset.inst = name;
+      cb.addEventListener("change", function () {
+        state.genInstruments[this.dataset.inst] = this.checked;
+        generateAndLoadBeat();
+      });
+      var span = document.createElement("span");
+      span.textContent = name.replace(/([A-Z])/g, " $1").replace(/^./, function (s) { return s.toUpperCase(); });
+      label.appendChild(cb);
+      label.appendChild(span);
+      container.appendChild(label);
+    }
   }
 
   function rebuildAudioLoop() {
@@ -589,6 +697,34 @@
 
     const reactivity = parseFloat(p.get("reactivity") || "");
     if (Number.isFinite(reactivity)) state.reactivity = clamp(reactivity, 0, 1.5);
+
+    var audioSrc = p.get("audioSource");
+    if (audioSrc === "gen") {
+      state.audioSource = "generator";
+      var genre = p.get("genre");
+      if (genre && MarbleSequencer.GENRES[genre]) {
+        state.genreId = genre;
+        initGenreDefaults(genre);
+      }
+      var bpm = parseInt(p.get("bpm") || "", 10);
+      if (Number.isFinite(bpm) && bpm >= 60 && bpm <= 200) state.genBpm = bpm;
+      var bars = parseInt(p.get("bars") || "", 10);
+      if ([1, 2, 4, 8].indexOf(bars) >= 0) state.genBars = bars;
+      var instStr = p.get("inst") || "";
+      if (instStr) {
+        var instList = instStr.split(",");
+        for (var name in state.genInstruments) state.genInstruments[name] = false;
+        for (var i = 0; i < instList.length; i++) {
+          if (state.genInstruments.hasOwnProperty(instList[i])) {
+            state.genInstruments[instList[i]] = true;
+          }
+        }
+      }
+      var varSeed = parseInt(p.get("var") || "0", 10);
+      if (Number.isFinite(varSeed)) state.genVariationSeed = varSeed;
+    } else if (audioSrc === "file") {
+      state.audioSource = "file";
+    }
   }
 
   function writeURL() {
@@ -605,6 +741,18 @@
     }
     if (state.audioStart > 0) p.set("audioStart", state.audioStart.toFixed(3));
     if (state.reactivity !== 1.0) p.set("reactivity", state.reactivity.toFixed(2));
+    if (state.audioSource === "generator") {
+      p.set("audioSource", "gen");
+      p.set("genre", state.genreId);
+      p.set("bpm", String(state.genBpm));
+      p.set("bars", String(state.genBars));
+      var enabledInst = [];
+      for (var name in state.genInstruments) {
+        if (state.genInstruments[name]) enabledInst.push(name);
+      }
+      p.set("inst", enabledInst.join(","));
+      if (state.genVariationSeed > 0) p.set("var", String(state.genVariationSeed));
+    }
     history.replaceState(null, "", `?${p.toString()}`);
   }
 
@@ -1090,7 +1238,7 @@
       muxer.finalize();
       const bytes = muxer.target.buffer;
       const blob = new Blob([bytes], { type: "video/mp4" });
-      const suffix = state.features ? "_audio" : "";
+      const suffix = state.features ? (state.audioSource === "generator" ? "_" + state.genreId : "_audio") : "";
       const filename = `marblewalls_${state.seed}_${w}x${h}_${durationSec}s_${fps}fps${suffix}.mp4`;
       triggerDownload(blob, filename);
       toast(`MP4 exported (${formatBytes(blob.size)})`);
@@ -1183,20 +1331,46 @@
     els.animSize.value = String(state.animSizeP);
     els.animFps.value = String(state.videoFps);
     updateAnimWarning();
-    // Audio controls
-    var hasAudio = !!state.audioFile;
-    els.audioControls.hidden = !hasAudio;
-    els.audioClear.hidden = !hasAudio;
+    // Audio source toggle
+    var isGen = state.audioSource === "generator";
+    els.sourceFile.classList.toggle("active", !isGen);
+    els.sourceGen.classList.toggle("active", isGen);
+    els.audioFileView.hidden = isGen;
+    els.audioGenView.hidden = !isGen;
+
+    if (isGen) {
+      els.genGenre.value = state.genreId;
+      els.genBpm.value = state.genBpm;
+      els.genBpmReadout.textContent = String(state.genBpm);
+      els.genBars.value = state.genBars;
+    }
+
+    // Audio badge
+    var hasAudio = !!(state.features);
     els.audioBadge.hidden = !hasAudio;
-    els.audioFileName.textContent = hasAudio ? state.audioFile.name : "No file";
+    if (hasAudio && isGen) {
+      var genre = MarbleSequencer.GENRES[state.genreId];
+      els.audioBadge.textContent = "\u266B " + (genre ? genre.name : "beat");
+    } else if (hasAudio) {
+      els.audioBadge.textContent = "\u266B audio";
+    }
+
+    // File mode controls
+    if (!isGen) {
+      var hasFile = !!state.audioFile;
+      els.audioControls.hidden = !hasFile;
+      els.audioClear.hidden = !hasFile;
+      els.audioFileName.textContent = hasFile ? state.audioFile.name : "No file";
+      if (hasFile && state.audioTrackDuration > 0) {
+        var maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
+        els.audioStart.max = maxStart;
+        els.audioStart.value = state.audioStart;
+        els.audioStartReadout.textContent = formatTime(state.audioStart);
+      }
+    }
+
     els.audioReactivity.value = state.reactivity;
     els.audioReactivityReadout.textContent = state.reactivity.toFixed(2);
-    if (hasAudio && state.audioTrackDuration > 0) {
-      var maxStart = Math.max(0, state.audioTrackDuration - state.animDurationSec);
-      els.audioStart.max = maxStart;
-      els.audioStart.value = state.audioStart;
-      els.audioStartReadout.textContent = formatTime(state.audioStart);
-    }
     // Palette controls
     syncPaletteControlsFromState();
   }
@@ -1356,6 +1530,32 @@
   els.audioPlay.addEventListener("click", startAudioPreview);
   els.audioPause.addEventListener("click", stopAudioPreview);
 
+  els.sourceFile.addEventListener("click", function () { setAudioSource("file"); });
+  els.sourceGen.addEventListener("click", function () { setAudioSource("generator"); });
+
+  els.genGenre.addEventListener("change", function (e) {
+    initGenreDefaults(e.target.value);
+    buildInstrumentToggles();
+    syncControlsFromState();
+    generateAndLoadBeat();
+  });
+
+  els.genBpm.addEventListener("input", function (e) {
+    state.genBpm = parseInt(e.target.value, 10) || 85;
+    els.genBpmReadout.textContent = String(state.genBpm);
+    generateAndLoadBeat();
+  });
+
+  els.genBars.addEventListener("change", function (e) {
+    state.genBars = parseInt(e.target.value, 10) || 4;
+    generateAndLoadBeat();
+  });
+
+  els.genRandomize.addEventListener("click", function () {
+    state.genVariationSeed = Math.floor(Math.random() * 1000000);
+    generateAndLoadBeat();
+  });
+
   els.canvas.parentElement.addEventListener("dragover", (e) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
@@ -1379,19 +1579,27 @@
     els.audioFileInput.disabled = true;
     els.audioFileName.textContent = "Audio requires a modern browser";
   }
+  if (typeof OfflineAudioContext === "undefined") {
+    els.sourceGen.hidden = true;
+    if (state.audioSource === "generator") setAudioSource("file");
+  }
 
   function updateExportTooltips() {
-    const hasAudio = !!state.audioFile;
-    els.exportGif.title = hasAudio
-      ? "Export looping GIF (silent — GIF has no audio)"
-      : "Export looping GIF at 24 fps";
-    els.exportMp4.title = hasAudio
-      ? "Export looping MP4 with embedded audio"
-      : "Export looping MP4 video at the selected frame rate";
+    var hasAudio = !!(state.features);
+    if (state.audioSource === "generator" && hasAudio) {
+      els.exportGif.title = "Export looping GIF (silent — GIF has no audio)";
+      els.exportMp4.title = "Export looping MP4 with generated beat";
+    } else if (state.audioSource === "file" && state.audioFile) {
+      els.exportGif.title = "Export looping GIF (silent — GIF has no audio)";
+      els.exportMp4.title = "Export looping MP4 with embedded audio";
+    } else {
+      els.exportGif.title = "Export looping GIF at 24 fps";
+      els.exportMp4.title = "Export looping MP4 video at the selected frame rate";
+    }
   }
 
   els.share.addEventListener("click", async () => {
-    if (state.audioFile) {
+    if (state.audioSource === "file" && state.audioFile) {
       toast("Share captures visual settings but not the audio file — export the MP4 to share with audio.");
       writeURL();
       try { await navigator.clipboard.writeText(location.href); } catch (_) {}
@@ -1418,7 +1626,14 @@
 
   // ---- Boot -------------------------------------------------------------
   loadFromURL();
+  if (Object.keys(state.genInstruments).length === 0) {
+    initGenreDefaults(state.genreId);
+  }
+  buildInstrumentToggles();
   syncControlsFromState();
   renderPreview();
   writeURL();
+  if (state.audioSource === "generator") {
+    generateAndLoadBeat();
+  }
 })();
